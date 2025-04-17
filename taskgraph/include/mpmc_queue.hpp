@@ -11,10 +11,11 @@ namespace tg {
 // Unbounded MPMC Blocking Queue
 template <typename T>
 class UnboundedMPMCBlockingQueue {
+
+  static_assert(std::is_pointer_v<T>, "T must be a pointer type");
+
  public:
   void Push(T value);
-
-  void PushBatch(std::vector<T> batch);
 
   std::optional<T> Pop();
 
@@ -48,11 +49,6 @@ void UnboundedMPMCBlockingQueue<T>::Push(T value) {
 }
 
 template <typename T>
-void UnboundedMPMCBlockingQueue<T>::PushBatch(std::vector<T> batch) {
-
-}
-
-template <typename T>
 std::optional<T> UnboundedMPMCBlockingQueue<T>::Pop() {
   std::unique_lock lock(mutex_);
 
@@ -71,7 +67,8 @@ std::optional<T> UnboundedMPMCBlockingQueue<T>::Pop() {
 }
 
 template <typename T>
-std::optional<std::vector<T>> UnboundedMPMCBlockingQueue<T>::PopBatch(std::size_t workers) {
+std::optional<std::vector<T>> UnboundedMPMCBlockingQueue<T>::PopBatch(
+    std::size_t workers) {
   std::unique_lock lock(mutex_);
 
   if (closed_ && buffer_.empty()) {
