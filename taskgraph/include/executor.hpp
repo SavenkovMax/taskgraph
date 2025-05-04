@@ -2,27 +2,49 @@
 
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <future>
+#include <random>
+#include <ratio>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 #include "graph.hpp"
-#include "mpmc_queue.hpp"
+#include "semaphore.hpp"
 #include "workstealing_deque.hpp"
+#include "xoroshiro128.hpp"
 
 namespace tg {
 
 namespace detail {
 
-struct Worker {
-  constexpr static size_t kTaskQueueSize = 256;
+class OneShot {
+ public:
+  // Stores a copy of the TaskNode
+  OneShot(TaskNode* task) : task_(task) {}
 
-  std::atomic_flag stopped_{};
-  size_t id{};
-  std::thread thread;
-  BoundedTaskQueue<TaskNode*, kTaskQueueSize> lrq{};
+  auto get_future() { return promise_.get_future(); }
+
+  void operator()() && {
+    try {
+      task_->Run();
+      promise_.set_value();
+    } catch (...) {
+      promise_.set_exception(std::current_exception());
+    }
+  }
+
+ private:
+  std::promise<void> promise_;
+  TaskNode* task_;
+};
+
+struct SemaDeque {
+  tg::Semaphore sem{0};
+  WorkStealingDeque<TaskNode*> tasks;
 };
 
 struct TaskGraphContext {
@@ -36,124 +58,98 @@ struct TaskGraphContext {
 
 class Executor {
  public:
-  explicit Executor(size_t workers = static_cast<size_t>(
+  explicit Executor(const size_t workers = static_cast<size_t>(
                         std::thread::hardware_concurrency()));
 
   ~Executor();
 
-  void Submit(TaskNode* task);
-
   std::future<void> Run(TaskGraph& graph);
 
-  // Returns an ownership thread local pointer to the current ThreadPool
+  // Returns an ownership thread local pointer to the current Executor
   static Executor* Current() { return thread_local_instance_; }
 
   // Returns a count of workers
-  size_t Size() const noexcept { return workers_.size(); }
-
+  [[nodiscard]] size_t Size() const noexcept { return threads_.size(); }
 
  private:
-  void StartWorkerThreads(size_t workers);
-  void WorkerRoutine(size_t worker_id);
-  void ScheduleTask(TaskNode* task);
   void OnTaskCompletion(TaskNode* task);
-  void BuildTaskGraphContext(TaskGraph& graph, detail::TaskGraphContext& context);
-
-  // Work-stealing
-
-  void FindRunnable(size_t worker_id);
-
-  void StealWork(size_t thief, size_t victim);
+  void BuildTaskGraphContext(TaskGraph& graph,
+                             detail::TaskGraphContext& context);
+  void Execute(TaskNode* task);
+  auto Enqueue(TaskNode* task);
 
  private:
   static inline thread_local Executor* thread_local_instance_{nullptr};
 
-  std::vector<detail::Worker> workers_{};
-  UnboundedMPMCBlockingQueue<TaskNode*> tasks_{};
-  // TODO : std::variant for different execution contexts???
+  std::atomic<std::int64_t> in_flight_{0};
+  size_t count_{0};
+  std::vector<detail::SemaDeque> deques_;
+  std::vector<std::jthread> threads_;
   detail::TaskGraphContext graph_context_{};
 };
 
-Executor::Executor(size_t workers) : workers_(workers) {
-  StartWorkerThreads(workers_.size());
-}
+Executor::Executor(const size_t workers) : deques_(workers) {
+  for (std::size_t i = 0; i < workers; ++i) {
+    threads_.emplace_back([&, id = i](std::stop_token tok) {
+      jump(id);  // Get a different random stream
+      do {
+        // Wait to be signalled
+        deques_[id].sem.AcquireMany();
 
-Executor::~Executor() {
-  for (size_t i = 0; i < workers_.size(); ++i) {
-    workers_[i].stopped_.test_and_set(std::memory_order_release);
-  }
-  tasks_.Close();
-  for (auto& t : workers_) {
-    t.thread.join();
-  }
-}
+        std::size_t spin = 0;
 
-void Executor::Submit(TaskNode* task) {
-  tasks_.Push(task);
-}
+        do {
+          // Prioritise our work otherwise steal
+          std::size_t t = spin++ < 100 || !deques_[id].tasks.Empty()
+                              ? id
+                              : xoroshiro128() % deques_.size();
 
-void Executor::StartWorkerThreads(size_t workers) {
-  for (size_t i = 0; i < workers; ++i) {
-    workers_[i].id = i;
-    workers_[i].thread = std::thread([this, i] {
-      thread_local_instance_ = this;
-      WorkerRoutine(i);
+          if (std::optional one_shot = deques_[t].tasks.Steal()) {
+            in_flight_.fetch_sub(1, std::memory_order_release);
+            auto fn = *one_shot;
+            fn->Run();
+            OnTaskCompletion(fn);
+          }
+
+          // Loop until all the work is done.
+        } while (in_flight_.load(std::memory_order_acquire) > 0);
+
+      } while (!tok.stop_requested());
     });
   }
 }
 
-void Executor::WorkerRoutine(size_t worker_id) {
-  while (!workers_[worker_id].stopped_.test(std::memory_order_acquire)) {
-    auto task_opt = tasks_.Pop();
-    if (task_opt.has_value()) {
-      auto& task = task_opt.value();
-      task->Run();
-      OnTaskCompletion(task);
-    }
+Executor::~Executor() {
+  for (auto& t : threads_) {
+    t.request_stop();
+  }
+  for (auto& d : deques_) {
+    d.sem.Release();
   }
 }
 
-void Executor::ScheduleTask(TaskNode* task) {
-  tasks_.Push(task);
+auto Executor::Enqueue(TaskNode* task) {
+  auto one_shot = detail::OneShot(task);
+  auto future = one_shot.get_future();
+
+  Execute(task);
+
+  return future;
 }
 
-void Executor::FindRunnable(size_t worker_id) {
-  //auto& worker = workers_[worker_id];
-  //// local run queue
-  //{
-  //  auto task_opt = worker.lrq.Pop();
-  //  if (task_opt.has_value()) {
-  //    auto& task = task_opt.value();
-  //    (*task)();
-  //    return;
-  //  }
-  //}
+void Executor::Execute(TaskNode* task) {
+  size_t i = count_++ % deques_.size();
 
-  //// global run queue
-  //{
-  //  auto tasks_opt = tasks_.PopBatch(workers_.size());
-  //  if (tasks_opt.has_value()) {
-  //    auto& tasks = tasks_opt.value();
-  //    for (auto& task : tasks) {
-  //      worker.lrq.TryPush(&task);
-  //    }
-  //    return;
-  //  }
-  //}
-}
-
-void Executor::StealWork(size_t thief, size_t victim) {
-  auto item = workers_[victim].lrq.TrySteal();
-  if (item.has_value()) {
-    workers_[thief].lrq.TryPush(item.value());
-  }
+  in_flight_.fetch_add(1, std::memory_order_relaxed);
+  deques_[i].tasks.Emplace(task);
+  deques_[i].sem.Release();
 }
 
 void Executor::OnTaskCompletion(TaskNode* task) {
   for (TaskNode* successor : task->GetSuccessors()) {
     if (graph_context_.tasks_dependencies[successor].fetch_sub(
             1, std::memory_order_acq_rel) == 1) {
-      ScheduleTask(successor);
+      Enqueue(successor);
     }
   }
   if (graph_context_.tasks_remaining.fetch_sub(1, std::memory_order_relaxed) ==
@@ -162,7 +158,8 @@ void Executor::OnTaskCompletion(TaskNode* task) {
   }
 }
 
-void Executor::BuildTaskGraphContext(TaskGraph& graph, detail::TaskGraphContext& context) {
+void Executor::BuildTaskGraphContext(TaskGraph& graph,
+                                     detail::TaskGraphContext& context) {
   context.promise = std::promise<void>();
   context.ready_queue.clear();
   context.tasks_dependencies.clear();
@@ -188,7 +185,7 @@ std::future<void> Executor::Run(TaskGraph& graph) {
   std::future<void> future = context.promise.get_future();
 
   for (auto& task : context.ready_queue) {
-    ScheduleTask(task);
+    Enqueue(task);
   }
 
   return future;

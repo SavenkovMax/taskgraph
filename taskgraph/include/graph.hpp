@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -10,14 +9,10 @@ namespace tg {
 
 // The class represents the task graph node.
 // Task is not copyable, it is made only movable in order to support move-only lambdas.
-// TODO: enum class TaskState ???
 class TaskNode {
  public:
   template <typename F>
   TaskNode(F&& function);
-
-  template <typename F, typename C>
-  TaskNode(F&& function, C&& callback);
 
   // Non-copyable
   TaskNode(const TaskNode&) = delete;
@@ -28,12 +23,6 @@ class TaskNode {
 
   // Move-assignable
   TaskNode& operator=(TaskNode&& other) noexcept;
-
-  template <typename F>
-  void SetTask(F&& function);
-
-  template <typename C>
-  void SetCallback(C&& callback);
 
   // Creates a precedence links from this to other tasks
   template <typename... Tasks>
@@ -55,7 +44,6 @@ class TaskNode {
 
  private:
   Task func_;
-  Task callback_;
 
   std::size_t dependencies_{};
   std::vector<TaskNode*> successors_{};
@@ -65,10 +53,6 @@ class TaskNode {
 
 template <typename F>
 TaskNode::TaskNode(F&& function) : func_(std::forward<F>(function)) {}
-
-template <typename F, typename C>
-TaskNode::TaskNode(F&& function, C&& callback)
-    : func_(std::forward<F>(function)), callback_(std::forward<C>(callback)) {}
 
 TaskNode::TaskNode(TaskNode&& other) noexcept
     : func_(std::move(other.func_)),
@@ -83,16 +67,6 @@ TaskNode& TaskNode::operator=(TaskNode&& other) noexcept {
   dependencies_ = other.dependencies_;
   successors_ = std::move(other.successors_);
   return *this;
-}
-
-template <typename F>
-void TaskNode::SetTask(F&& function) {
-  func_ = std::forward<F>(function);
-}
-
-template <typename C>
-void TaskNode::SetCallback(C&& callback) {
-  callback_ = std::forward<C>(callback);
 }
 
 template <typename... Tasks>
